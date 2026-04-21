@@ -13,20 +13,31 @@
 
 // 与服务端完全一致的结构体定义
 #pragma pack(push, 1)
-typedef struct {
+typedef struct
+{
     char name[101];
     uint32_t mode;
     uint64_t size;
 } file_info_t;
+
+// 续传请求结构体
+typedef struct
+{
+    char name[101];
+    uint64_t offset;
+} resume_request_t;
 #pragma pack(pop)
 
-int recv_all(int sockfd, void *buf, size_t len) {
+int recv_all(int sockfd, void *buf, size_t len)
+{
     size_t total = 0;
     ssize_t n;
     char *ptr = (char *)buf;
-    while (total < len) {
+    while (total < len)
+    {
         n = recv(sockfd, ptr + total, len - total, 0);
-        if (n <= 0) {
+        if (n <= 0)
+        {
             return -1;
         }
         total += n;
@@ -34,11 +45,30 @@ int recv_all(int sockfd, void *buf, size_t len) {
     return 0;
 }
 
-int receive_file(int sockfd) {
+int send_all(int sockfd, const void *buf, size_t len)
+{
+    size_t total = 0;
+    ssize_t n;
+    const char *ptr = (const char *)buf;
+    while (total < len)
+    {
+        n = send(sockfd, ptr + total, len - total, 0);
+        if (n <= 0)
+        {
+            return -1;
+        }
+        total += n;
+    }
+    return 0;
+}
+
+int receive_file(int sockfd)
+{
     file_info_t info;
 
     // 1. 接收文件信息结构体
-    if (recv_all(sockfd, &info, sizeof(info)) < 0) {
+    if (recv_all(sockfd, &info, sizeof(info)) < 0)
+    {
         fprintf(stderr, "Failed to receive file info: %s\n", strerror(errno));
         return -1;
     }
@@ -49,13 +79,15 @@ int receive_file(int sockfd) {
     safe_name[sizeof(info.name)] = '\0';
 
     // 检查文件名是否为空或包含非法字符
-    if (safe_name[0] == '\0') {
+    if (safe_name[0] == '\0')
+    {
         fprintf(stderr, "Received empty filename\n");
         return -1;
     }
 
     // 检查文件名是否包含路径分隔符，防止路径遍历攻击
-    if (strchr(safe_name, '/') != NULL || strchr(safe_name, '\\') != NULL) {
+    if (strchr(safe_name, '/') != NULL || strchr(safe_name, '\\') != NULL)
+    {
         fprintf(stderr, "Filename contains path separators: %s\n", safe_name);
         return -1;
     }
@@ -63,33 +95,116 @@ int receive_file(int sockfd) {
     printf("Receiving file: %s, size: %" PRIu64 " bytes, mode: %o\n",
            safe_name, info.size, info.mode);
 
-    // 3. 创建本地文件
-    int fd = open(safe_name, O_WRONLY | O_CREAT | O_TRUNC, info.mode);
-    if (fd < 0) {
-        fprintf(stderr, "Failed to open file %s: %s\n", safe_name, strerror(errno));
-        return -1;
+    // 3. 检查文件是否存在，获取当前大小
+    struct stat st;
+    uint64_t existing_size = 0;
+    int fd;
+
+    if (stat(safe_name, &st) == 0)
+    {
+        existing_size = st.st_size;
+        printf("Existing file found, current size: %" PRIu64 " bytes\n", existing_size);
+
+        if (existing_size >= info.size)
+        {
+            printf("File already complete, skipping transfer\n");
+            return 0;
+        }
+
+        // 打开文件进行追加
+        fd = open(safe_name, O_WRONLY | O_APPEND, info.mode);
+        if (fd < 0)
+        {
+            fprintf(stderr, "Failed to open file %s for appending: %s\n", safe_name, strerror(errno));
+            return -1;
+        }
+
+        // 发送续传请求
+        resume_request_t req;
+        strncpy(req.name, safe_name, sizeof(req.name));
+        req.offset = existing_size;
+
+        if (send_all(sockfd, &req, sizeof(req)) < 0)
+        {
+            fprintf(stderr, "Failed to send resume request: %s\n", strerror(errno));
+            close(fd);
+            return -1;
+        }
+
+        printf("Resume request sent, starting from offset: %" PRIu64 "\n", existing_size);
+    }
+    else
+    {
+        // 文件不存在，创建新文件
+        fd = open(safe_name, O_WRONLY | O_CREAT | O_TRUNC, info.mode);
+        if (fd < 0)
+        {
+            fprintf(stderr, "Failed to open file %s: %s\n", safe_name, strerror(errno));
+            return -1;
+        }
+
+        // 发送初始请求（偏移量为0）
+        resume_request_t req;
+        strncpy(req.name, safe_name, sizeof(req.name));
+        req.offset = 0;
+
+        if (send_all(sockfd, &req, sizeof(req)) < 0)
+        {
+            fprintf(stderr, "Failed to send initial request: %s\n", strerror(errno));
+            close(fd);
+            return -1;
+        }
     }
 
     // 4. 接收文件内容
     char buffer[BUFFER_SIZE];
-    uint64_t remaining = info.size;
-    while (remaining > 0) {
+    uint64_t remaining = info.size - existing_size;
+    uint64_t total_received = 0;
+    printf("Remaining data to receive: %" PRIu64 " bytes\n", remaining);
+
+    while (remaining > 0)
+    {
         size_t to_read = (remaining < BUFFER_SIZE) ? remaining : BUFFER_SIZE;
         ssize_t n = recv(sockfd, buffer, to_read, 0);
-        if (n <= 0) {
+        if (n <= 0)
+        {
             fprintf(stderr, "Failed to receive file data: %s\n", strerror(errno));
             close(fd);
             return -1;
         }
-        if (write(fd, buffer, n) != n) {
+        if (write(fd, buffer, n) != n)
+        {
             fprintf(stderr, "Failed to write file data: %s\n", strerror(errno));
             close(fd);
             return -1;
         }
         remaining -= n;
-    }
+        total_received += n;
 
-    if (close(fd) < 0) {
+        // 显示进度条
+        if (info.size > 0)
+        {
+            int progress = (int)((total_received + existing_size) * 100 / info.size);
+            printf("\rProgress: [");
+            for (int i = 0; i < 50; i++)
+            {
+                if (i < progress / 2)
+                {
+                    printf("=");
+                }
+                else
+                {
+                    printf(" ");
+                }
+            }
+            printf("] %d%%", progress);
+            fflush(stdout);
+        }
+    }
+    printf("\n");
+
+    if (close(fd) < 0)
+    {
         fprintf(stderr, "Failed to close file %s: %s\n", safe_name, strerror(errno));
         return -1;
     }
@@ -98,15 +213,18 @@ int receive_file(int sockfd) {
     return 0;
 }
 
-int main(int argc, char *argv[]) {
-    if (argc != 3) {
+int main(int argc, char *argv[])
+{
+    if (argc != 3)
+    {
         fprintf(stderr, "Usage: %s <server_ip> <port>\n", argv[0]);
         exit(EXIT_FAILURE);
     }
 
     const char *server_ip = argv[1];
     int port = atoi(argv[2]);
-    if (port <= 0 || port > 65535) {
+    if (port <= 0 || port > 65535)
+    {
         fprintf(stderr, "Invalid port number: %s\n", argv[2]);
         exit(EXIT_FAILURE);
     }
@@ -115,7 +233,8 @@ int main(int argc, char *argv[]) {
     struct sockaddr_in servaddr;
 
     sockfd = socket(AF_INET, SOCK_STREAM, 0);
-    if (sockfd < 0) {
+    if (sockfd < 0)
+    {
         perror("socket");
         exit(EXIT_FAILURE);
     }
@@ -123,13 +242,15 @@ int main(int argc, char *argv[]) {
     memset(&servaddr, 0, sizeof(servaddr));
     servaddr.sin_family = AF_INET;
     servaddr.sin_port = htons(port);
-      if (inet_pton(AF_INET, server_ip, &servaddr.sin_addr) <= 0) {
+    if (inet_pton(AF_INET, server_ip, &servaddr.sin_addr) <= 0)
+    {
         fprintf(stderr, "Invalid IP address: %s\n", server_ip);
-      close(sockfd);
-    exit(EXIT_FAILURE);
+        close(sockfd);
+        exit(EXIT_FAILURE);
     }
 
-    if (connect(sockfd, (struct sockaddr *)&servaddr, sizeof(servaddr)) < 0) {
+    if (connect(sockfd, (struct sockaddr *)&servaddr, sizeof(servaddr)) < 0)
+    {
         perror("connect");
         close(sockfd);
         exit(EXIT_FAILURE);
@@ -138,10 +259,13 @@ int main(int argc, char *argv[]) {
     printf("Connected to %s:%d\n", server_ip, port);
 
     // 接收文件，服务器会在发送完所有文件后关闭连接
-    while (1) {
-        if (receive_file(sockfd) < 0) {
+    while (1)
+    {
+        if (receive_file(sockfd) < 0)
+        {
             // 连接关闭是正常的退出条件
-            if (errno == ECONNRESET || errno == EPIPE) {
+            if (errno == ECONNRESET || errno == EPIPE)
+            {
                 printf("Server closed connection. All files received.\n");
                 break;
             }
