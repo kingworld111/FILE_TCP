@@ -8,10 +8,10 @@
 #include <fcntl.h>
 #include <inttypes.h>
 #include <errno.h>
+#include <stdint.h>
 
 #define BUFFER_SIZE 1024
 
-// 与服务端完全一致的结构体定义
 #pragma pack(push, 1)
 typedef struct
 {
@@ -20,7 +20,6 @@ typedef struct
     uint64_t size;
 } file_info_t;
 
-// 续传请求结构体
 typedef struct
 {
     char name[101];
@@ -66,36 +65,31 @@ int receive_file(int sockfd)
 {
     file_info_t info;
 
-    // 1. 接收文件信息结构体
     if (recv_all(sockfd, &info, sizeof(info)) < 0)
     {
         fprintf(stderr, "Failed to receive file info: %s\n", strerror(errno));
         return -1;
     }
 
-    // 2. 确保文件名以 '\0' 结尾
     char safe_name[102] = {0};
-    strncpy(safe_name, info.name, sizeof(info.name));
+    strncpy(safe_name, info.name, sizeof(safe_name) - 1);
     safe_name[sizeof(info.name)] = '\0';
 
-    // 检查文件名是否为空或包含非法字符
     if (safe_name[0] == '\0')
     {
         fprintf(stderr, "Received empty filename\n");
         return -1;
     }
 
-    // 检查文件名是否包含路径分隔符，防止路径遍历攻击
     if (strchr(safe_name, '/') != NULL || strchr(safe_name, '\\') != NULL)
     {
         fprintf(stderr, "Filename contains path separators: %s\n", safe_name);
         return -1;
     }
 
-    printf("Receiving file: %s, size: %" PRIu64 " bytes, mode: %o\n",
-           safe_name, info.size, info.mode);
+    printf("Receiving file: %s, size: %" PRIu64 " bytes\n",
+           safe_name, info.size);
 
-    // 3. 检查文件是否存在，获取当前大小
     struct stat st;
     uint64_t existing_size = 0;
     int fd;
@@ -103,15 +97,17 @@ int receive_file(int sockfd)
     if (stat(safe_name, &st) == 0)
     {
         existing_size = st.st_size;
-        printf("Existing file found, current size: %" PRIu64 " bytes\n", existing_size);
 
         if (existing_size >= info.size)
         {
             printf("File already complete, skipping transfer\n");
+            resume_request_t req;
+            strncpy(req.name, safe_name, sizeof(req.name));
+            req.offset = info.size;
+            send_all(sockfd, &req, sizeof(req));
             return 0;
         }
 
-        // 打开文件进行追加
         fd = open(safe_name, O_WRONLY | O_APPEND, info.mode);
         if (fd < 0)
         {
@@ -119,7 +115,6 @@ int receive_file(int sockfd)
             return -1;
         }
 
-        // 发送续传请求
         resume_request_t req;
         strncpy(req.name, safe_name, sizeof(req.name));
         req.offset = existing_size;
@@ -131,11 +126,10 @@ int receive_file(int sockfd)
             return -1;
         }
 
-        printf("Resume request sent, starting from offset: %" PRIu64 "\n", existing_size);
+        printf("Resume from offset: %" PRIu64 "\n", existing_size);
     }
     else
     {
-        // 文件不存在，创建新文件
         fd = open(safe_name, O_WRONLY | O_CREAT | O_TRUNC, info.mode);
         if (fd < 0)
         {
@@ -143,7 +137,6 @@ int receive_file(int sockfd)
             return -1;
         }
 
-        // 发送初始请求（偏移量为0）
         resume_request_t req;
         strncpy(req.name, safe_name, sizeof(req.name));
         req.offset = 0;
@@ -156,11 +149,9 @@ int receive_file(int sockfd)
         }
     }
 
-    // 4. 接收文件内容
     char buffer[BUFFER_SIZE];
     uint64_t remaining = info.size - existing_size;
     uint64_t total_received = 0;
-    printf("Remaining data to receive: %" PRIu64 " bytes\n", remaining);
 
     while (remaining > 0)
     {
@@ -181,23 +172,24 @@ int receive_file(int sockfd)
         remaining -= n;
         total_received += n;
 
-        // 显示进度条
         if (info.size > 0)
         {
             int progress = (int)((total_received + existing_size) * 100 / info.size);
-            printf("\rProgress: [");
-            for (int i = 0; i < 50; i++)
+            int filled = progress / 5;
+            printf("\r  [");
+            for (int i = 0; i < 20; i++)
             {
-                if (i < progress / 2)
-                {
-                    printf("=");
-                }
+                if (i < filled)
+                    printf("█");
+                else if (i == filled)
+                    printf("▓");
                 else
-                {
-                    printf(" ");
-                }
+                    printf("░");
             }
-            printf("] %d%%", progress);
+            printf("] %3d%% (%llu/%llu bytes)",
+                   progress,
+                   (unsigned long long)(total_received + existing_size),
+                   (unsigned long long)info.size);
             fflush(stdout);
         }
     }
@@ -258,24 +250,28 @@ int main(int argc, char *argv[])
 
     printf("Connected to %s:%d\n", server_ip, port);
 
-    // 接收文件，服务器会在发送完所有文件后关闭连接
-    while (1)
+    uint32_t file_count;
+    if (recv_all(sockfd, &file_count, sizeof(file_count)) < 0)
     {
+        fprintf(stderr, "Failed to receive file count\n");
+        close(sockfd);
+        return EXIT_FAILURE;
+    }
+    file_count = ntohl(file_count);
+    printf("Server will send %u files\n", file_count);
+
+    for (uint32_t i = 0; i < file_count; i++)
+    {
+        printf("\n[File %u/%u] ", i + 1, file_count);
         if (receive_file(sockfd) < 0)
         {
-            // 连接关闭是正常的退出条件
-            if (errno == ECONNRESET || errno == EPIPE)
-            {
-                printf("Server closed connection. All files received.\n");
-                break;
-            }
-            fprintf(stderr, "File transfer failed: %s\n", strerror(errno));
+            fprintf(stderr, "File transfer failed\n");
             close(sockfd);
             return EXIT_FAILURE;
         }
     }
 
     close(sockfd);
-    printf("All files received successfully.\n");
+    printf("\nAll files received successfully.\n");
     return 0;
 }

@@ -13,19 +13,17 @@
 #include <limits.h>
 #include <errno.h>
 #include <sys/time.h>
+#include <stdint.h>
 
 #pragma pack(push, 1)
 
 typedef struct
 {
-	char name[101]; // 文件名最大长度不超过 100 字节
-	uint32_t mode;	// 文件模式
-	uint64_t size;	// 文件大小
-					// ......        // 更多文件属性可以扩展
-
+	char name[101];
+	uint32_t mode;
+	uint64_t size;
 } file_info_t;
 
-// 续传请求结构体
 typedef struct
 {
 	char name[101];
@@ -39,15 +37,19 @@ typedef struct
 	int sock_conn;
 	char ip[16];
 	unsigned short port;
-	time_t online_time;	   // 上线时间
-	char **send_file_list; // 待发送的文件路径列表
-	int send_file_cnt;	   // 待发送的文件数量
-						   // char user_name[50];  // 用户名
-						   //......
-
+	time_t online_time;
+	char **send_file_list;
+	int send_file_cnt;
 } client_info_t;
 
-// 确保数据完整发送
+static volatile int running = 1;
+
+void signal_handler(int sig)
+{
+	(void)sig;
+	running = 0;
+}
+
 int send_all(int sockfd, const void *buf, size_t len)
 {
 	size_t total = 0;
@@ -65,10 +67,9 @@ int send_all(int sockfd, const void *buf, size_t len)
 	return 0;
 }
 
-// 全局变量
-#define MAX_CONNECTIONS 100									  // 最大并发连接数
-int connection_count = 0;									  // 当前连接数
-pthread_mutex_t connection_mutex = PTHREAD_MUTEX_INITIALIZER; // 连接数互斥锁
+#define MAX_CONNECTIONS 100
+int connection_count = 0;
+pthread_mutex_t connection_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 void *comm_thr(void *arg);
 int send_file(int sock, const char *file_path);
@@ -76,8 +77,9 @@ int send_file(int sock, const char *file_path);
 int main(int argc, char **argv)
 {
 	signal(SIGPIPE, SIG_IGN);
+	signal(SIGINT, signal_handler);
+	signal(SIGTERM, signal_handler);
 
-	// 校验参数
 	if (argc == 1)
 	{
 		fprintf(stderr, "Usage: %s file1 [...]\n", argv[0]);
@@ -86,14 +88,12 @@ int main(int argc, char **argv)
 
 	for (int i = 1; i < argc; i++)
 	{
-		// 检查文件是否存在且可读
 		if (-1 == access(argv[i], R_OK))
 		{
 			fprintf(stderr, "文件 %s 不存在或不可读！\n", argv[i]);
 			return 1;
 		}
 
-		// 检查文件是否为普通文件（不是目录或其他特殊文件）
 		struct stat st;
 		if (lstat(argv[i], &st) == -1)
 		{
@@ -107,14 +107,12 @@ int main(int argc, char **argv)
 			return 1;
 		}
 
-		// 检查文件路径长度是否合理
 		if (strlen(argv[i]) >= PATH_MAX)
 		{
 			fprintf(stderr, "文件路径 %s 过长！\n", argv[i]);
 			return 1;
 		}
 
-		// 检查文件路径是否包含路径遍历攻击字符
 		if (strstr(argv[i], "../") != NULL || strstr(argv[i], "..\\") != NULL)
 		{
 			fprintf(stderr, "文件路径 %s 包含非法字符！\n", argv[i]);
@@ -122,7 +120,6 @@ int main(int argc, char **argv)
 		}
 	}
 
-	// 第 1 步：创建监听套接字
 	int sock_listen = socket(AF_INET, SOCK_STREAM, 0);
 
 	if (-1 == sock_listen)
@@ -131,36 +128,26 @@ int main(int argc, char **argv)
 		exit(1);
 	}
 
-	// 开启地址复用，以允许服务器快速重启
 	int val = 1;
 	setsockopt(sock_listen, SOL_SOCKET, SO_REUSEADDR, &val, sizeof(val));
 
-	// 第 2 步：绑定地址
-
-	// 指定地址
 	struct sockaddr_in myaddr;
-	myaddr.sin_family = AF_INET;		 // 指定地址家族(AF)为 Internet 地址家族
-	myaddr.sin_addr.s_addr = INADDR_ANY; // 指定 IP 地址为本机任意地址
-	// myaddr.sin_addr.s_addr = inet_addr("172.16.251.96");  // 指定 IP 地址为本机的某个具体 IP 地址
-	myaddr.sin_port = htons(9413); // 指定端口号为 9413
+	myaddr.sin_family = AF_INET;
+	myaddr.sin_addr.s_addr = INADDR_ANY;
+	myaddr.sin_port = htons(6666);
 
-	// printf("%hu\n", htons(6666));  // 2586
-
-	// 绑定
 	if (-1 == bind(sock_listen, (struct sockaddr *)&myaddr, sizeof(myaddr)))
 	{
 		perror("bind fail");
 		exit(1);
 	}
 
-	// 第 3 步：监听
 	if (-1 == listen(sock_listen, 5))
 	{
 		perror("listen fail");
 		exit(1);
 	}
 
-	// 设置监听套接字为非阻塞模式
 	int flags = fcntl(sock_listen, F_GETFL, 0);
 	if (flags == -1)
 	{
@@ -172,8 +159,6 @@ int main(int argc, char **argv)
 		perror("fcntl F_SETFL fail");
 		exit(1);
 	}
-
-	// 第 4 步：接收客户端连接请求
 
 	int sock_conn;
 	pthread_t tid;
@@ -188,64 +173,52 @@ int main(int argc, char **argv)
 	fd_set read_set;
 	int max_fd;
 
-	printf("Server started, listening on port 9413\n");
-	while (1)
+	printf("Server started, listening on port 6666\n");
+	while (running)
 	{
-		printf("\nMain loop iteration\n");
-		// 检查连接数是否达到上限
 		pthread_mutex_lock(&connection_mutex);
-		printf("Current connection count: %d\n", connection_count);
 		if (connection_count >= MAX_CONNECTIONS)
 		{
 			pthread_mutex_unlock(&connection_mutex);
-			printf("Connection limit reached. Waiting...\n");
 			sleep(1);
 			continue;
 		}
 		pthread_mutex_unlock(&connection_mutex);
 
-		// 使用 select 实现 accept 超时
 		FD_ZERO(&read_set);
 		FD_SET(sock_listen, &read_set);
 		max_fd = sock_listen + 1;
 
-		tv.tv_sec = 5; // 5秒超时
+		tv.tv_sec = 5;
 		tv.tv_usec = 0;
 
-		printf("Calling select()...\n");
 		int ret = select(max_fd, &read_set, NULL, NULL, &tv);
 		if (ret < 0)
 		{
+			if (errno == EINTR)
+				continue;
 			perror("select fail");
 			continue;
 		}
 		else if (ret == 0)
 		{
-			// 超时，继续循环
-			printf("Select timeout\n");
 			continue;
 		}
 
-		// 检查是否有连接请求
 		if (FD_ISSET(sock_listen, &read_set))
 		{
-			printf("Connection request received\n");
 			sock_conn = accept(sock_listen, (struct sockaddr *)&client_addr, &addr_len);
 
 			if (-1 == sock_conn)
 			{
 				if (errno == EWOULDBLOCK || errno == EAGAIN)
 				{
-					// 非阻塞模式下没有连接请求，继续循环
-					printf("EWOULDBLOCK or EAGAIN\n");
 					continue;
 				}
 				perror("accept fail");
 				continue;
 			}
 
-			printf("Connection accepted, socket: %d\n", sock_conn);
-			// 增加连接数
 			pthread_mutex_lock(&connection_mutex);
 			connection_count++;
 			pthread_mutex_unlock(&connection_mutex);
@@ -256,49 +229,46 @@ int main(int argc, char **argv)
 			{
 				perror("malloc fail");
 				close(sock_conn);
-				// 减少连接数
 				pthread_mutex_lock(&connection_mutex);
 				connection_count--;
 				pthread_mutex_unlock(&connection_mutex);
 				continue;
 			}
 
-			// 获取当前上线的客户端信息
 			pci->sock_conn = sock_conn;
 			strncpy(pci->ip, inet_ntoa(client_addr.sin_addr), sizeof(pci->ip) - 1);
-			pci->ip[sizeof(pci->ip) - 1] = '\0'; // 确保字符串结束
+			pci->ip[sizeof(pci->ip) - 1] = '\0';
 			pci->port = ntohs(client_addr.sin_port);
 			pci->online_time = time(NULL);
 			pci->send_file_list = argv + 1;
 			pci->send_file_cnt = argc - 1;
 
-			printf("Creating thread for client %s:%hu\n", inet_ntoa(client_addr.sin_addr), ntohs(client_addr.sin_port));
+			printf("Client connected: %s:%hu\n", inet_ntoa(client_addr.sin_addr), ntohs(client_addr.sin_port));
 			if (pthread_create(&tid, NULL, comm_thr, pci))
 			{
 				perror("pthread_create fail");
 
 				free(pci);
 				close(sock_conn);
-				// 减少连接数
 				pthread_mutex_lock(&connection_mutex);
 				connection_count--;
 				pthread_mutex_unlock(&connection_mutex);
 				continue;
 			}
-			printf("Thread created successfully for client %s:%hu\n", inet_ntoa(client_addr.sin_addr), ntohs(client_addr.sin_port));
 
-			// 设置接收超时
-			setsockopt(sock_conn, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+			struct timeval recv_tv;
+			recv_tv.tv_sec = 10;
+			recv_tv.tv_usec = 0;
+			setsockopt(sock_conn, SOL_SOCKET, SO_RCVTIMEO, &recv_tv, sizeof(recv_tv));
 		}
 	}
 
-	// 第 7 步：关闭监听套接字
 	close(sock_listen);
+	printf("\nServer shutting down...\n");
 
 	return 0;
 }
 
-// 定义通信线程函数
 void *comm_thr(void *arg)
 {
 	client_info_t *pci = (client_info_t *)arg;
@@ -306,16 +276,21 @@ void *comm_thr(void *arg)
 
 	pthread_detach(pthread_self());
 
-	printf("\n通信线程启动，处理客户端(%s:%hu)\n", pci->ip, pci->port);
-	printf("待发送文件数量: %d\n", pci->send_file_cnt);
-	for (i = 0; i < pci->send_file_cnt; i++)
+	printf("\n客户端(%s:%hu)上线，待发送 %d 个文件\n", pci->ip, pci->port, pci->send_file_cnt);
+
+	// 先发送文件数量
+	uint32_t file_count = htonl(pci->send_file_cnt);
+	if (send_all(pci->sock_conn, &file_count, sizeof(file_count)) < 0)
 	{
-		printf("待发送文件[%d]: %s\n", i, pci->send_file_list[i]);
+		printf("发送文件数量失败\n");
+		close(pci->sock_conn);
+		pthread_mutex_lock(&connection_mutex);
+		connection_count--;
+		pthread_mutex_unlock(&connection_mutex);
+		free(pci);
+		return NULL;
 	}
 
-	printf("\n客户端(%s:%hu)上线...\n", pci->ip, pci->port);
-
-	// 第 5 步：收发数据
 	for (i = 0; i < pci->send_file_cnt; i++)
 	{
 		if ((err_code = send_file(pci->sock_conn, pci->send_file_list[i])) != 0)
@@ -329,10 +304,8 @@ void *comm_thr(void *arg)
 		}
 	}
 
-	// 第 6 步：断开连接（关闭连接套接字）
 	close(pci->sock_conn);
 
-	// 减少连接数
 	pthread_mutex_lock(&connection_mutex);
 	connection_count--;
 	pthread_mutex_unlock(&connection_mutex);
@@ -344,7 +317,6 @@ void *comm_thr(void *arg)
 	return NULL;
 }
 
-// 接收数据的辅助函数
 int recv_all(int sockfd, void *buf, size_t len)
 {
 	size_t total = 0;
@@ -357,15 +329,13 @@ int recv_all(int sockfd, void *buf, size_t len)
 		{
 			if (errno == EWOULDBLOCK || errno == EAGAIN)
 			{
-				// 非阻塞模式下暂时没有数据，等待一下
-				usleep(10000); // 10ms
+				usleep(10000);
 				continue;
 			}
 			return -1;
 		}
 		if (n == 0)
 		{
-			// 连接关闭
 			return -1;
 		}
 		total += n;
@@ -373,10 +343,9 @@ int recv_all(int sockfd, void *buf, size_t len)
 	return 0;
 }
 
-// 将指定文件发送给客户端
 int send_file(int sock, const char *file_path)
 {
-	file_info_t fi = {""};
+	file_info_t fi = {0};
 	const char *file_name = NULL;
 	struct stat st;
 	int fd, ret;
@@ -384,7 +353,6 @@ int send_file(int sock, const char *file_path)
 	uint64_t send_cnt = 0;
 	uint64_t offset = 0;
 
-	// 获取文件模式和大小
 	if (lstat(file_path, &st) == -1)
 	{
 		perror("lstat fail");
@@ -394,9 +362,6 @@ int send_file(int sock, const char *file_path)
 	fi.mode = st.st_mode;
 	fi.size = st.st_size;
 
-	printf("Sending file: %s, size: %llu bytes\n", file_path, (unsigned long long)fi.size);
-
-	// 获取文件名（不含路径）
 	file_name = strrchr(file_path, '/');
 
 	if (file_name == NULL)
@@ -406,14 +371,12 @@ int send_file(int sock, const char *file_path)
 
 	strncpy(fi.name, file_name, sizeof(fi.name) - 1);
 
-	// 发送文件属性信息
 	if (send_all(sock, &fi, sizeof(fi)) < 0)
 	{
 		fprintf(stderr, "send file attribute fail: %s\n", strerror(errno));
 		return 2;
 	}
 
-	// 接收客户端的续传请求
 	resume_request_t req;
 	if (recv_all(sock, &req, sizeof(req)) < 0)
 	{
@@ -422,10 +385,7 @@ int send_file(int sock, const char *file_path)
 	}
 
 	offset = req.offset;
-	printf("Received resume request: offset = %llu\n", (unsigned long long)offset);
 
-	// 发送文件数据内容
-	printf("Attempting to open file: %s\n", file_path);
 	fd = open(file_path, O_RDONLY);
 
 	if (fd == -1)
@@ -434,9 +394,6 @@ int send_file(int sock, const char *file_path)
 		return 4;
 	}
 
-	printf("File opened successfully, descriptor: %d\n", fd);
-
-	// 根据偏移量定位文件位置
 	if (offset > 0)
 	{
 		if (lseek(fd, offset, SEEK_SET) < 0)
@@ -445,48 +402,61 @@ int send_file(int sock, const char *file_path)
 			close(fd);
 			return 5;
 		}
-		printf("Seek to offset: %llu\n", (unsigned long long)offset);
 	}
 
-	// 读取并发送文件数据
+	uint64_t total_to_send = fi.size - offset;
+	printf("Sending: %s (%llu bytes)\n", file_name, (unsigned long long)total_to_send);
+
+	const char *spinners = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏";
+	int spin_idx = 0;
+
 	while ((ret = read(fd, buff, sizeof(buff))) > 0)
 	{
-		printf("Read %d bytes from file\n", ret);
 		if (send_all(sock, buff, ret) < 0)
 		{
 			fprintf(stderr, "send_all failed: %s\n", strerror(errno));
 			break;
 		}
-		printf("Sent %d bytes to client\n", ret);
 		send_cnt += ret;
+
+		if (total_to_send > 0)
+		{
+			int progress = (int)(send_cnt * 100 / total_to_send);
+			int filled = progress / 5;
+			printf("\r  %c ", spinners[spin_idx % 10]);
+			printf("[");
+			for (int i = 0; i < 20; i++)
+			{
+				if (i < filled)
+					printf("█");
+				else if (i == filled)
+					printf("▓");
+				else
+					printf("░");
+			}
+			printf("] %3d%% (%llu/%llu bytes)",
+				   progress,
+				   (unsigned long long)send_cnt,
+				   (unsigned long long)total_to_send);
+			fflush(stdout);
+			spin_idx++;
+		}
 	}
+	printf("\n");
 
 	if (ret < 0)
 	{
 		perror("read fail");
 	}
-	else
-	{
-		printf("End of file reached, total read: %llu bytes\n", (unsigned long long)send_cnt);
-	}
 
-	if (close(fd) < 0)
-	{
-		perror("close fail");
-	}
-	else
-	{
-		printf("File closed successfully\n");
-	}
+	close(fd);
 
-	// 检查是否发送了预期的数据量
-	if (send_cnt != (fi.size - offset))
+	if (send_cnt != total_to_send)
 	{
 		fprintf(stderr, "send file data fail: sent %llu, expected %llu\n",
-				(unsigned long long)send_cnt, (unsigned long long)(fi.size - offset));
+				(unsigned long long)send_cnt, (unsigned long long)total_to_send);
 		return 6;
 	}
 
-	printf("File sent successfully, total: %llu bytes\n", (unsigned long long)send_cnt);
-	return 0; // 发送文件成功
+	return 0;
 }
